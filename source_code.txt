@@ -1,0 +1,380 @@
+PDF_QnA_App/
+├── backend/
+│   ├── main.py
+│   ├── database.py
+│   ├── services.py
+│   ├── models.py
+│   ├── requirements.txt
+│   └── README.md
+├── frontend/
+│   ├── public/
+│   ├── src/
+│   │   ├── components/
+│   │   │   ├── UploadPDF.js
+│   │   │   ├── QuestionForm.js
+│   │   │   
+│   │   ├── App.js
+│   │   ├── index.js
+│   └── package.json
+└── README.md
+--------------------------------------------------------------------------------------------------------------------------------
+
+1. database.py
+This file contains the database connection setup.
+
+
+import uuid
+from sqlalchemy import create_engine, Column, String, DateTime, Text
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from datetime import datetime
+
+DATABASE_URL = "postgresql://pdf_user:your_password@localhost/pdf_app"
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+class PDFDocument(Base):
+    __tablename__ = "pdf_documents"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    filename = Column(String, index=True)
+    upload_date = Column(DateTime, default=datetime.utcnow)
+    content = Column(Text)  # Use Text for larger content
+
+def init_db():
+    Base.metadata.create_all(bind=engine)
+--------------------------------------------------------------------------------------------------------------------------------
+
+2. models.py
+Define a model for managing PDF documents.
+
+
+import fitz  # PyMuPDF for PDF processing
+import re
+from transformers import pipeline
+
+# Load the summarization model pipeline
+summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+
+
+# Function to extract text from each page of the PDF
+def extract_text_from_pdf(pdf_path):
+    doc = fitz.open(pdf_path)
+    text = ""
+    for page in doc:
+        text += page.get_text()
+    return text
+
+# Clean up the extracted text
+def preprocess_text(text):
+    # Remove excess whitespace and non-printable characters
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'\x0c', ' ', text)  # Remove page break characters
+    return text.strip()
+
+# Identify and extract relevant sections based on keywords
+def extract_key_sections(text):
+    sections = {
+        "growth_prospects": [],
+        "business_changes": [],
+        "key_triggers": [],
+        "material_effects": []
+    }
+    
+    # Split text into lines for easier keyword matching
+    lines = text.split('.')
+    
+    for line in lines:
+        line_lower = line.lower()
+        
+        if "growth" in line_lower or "prospect" in line_lower:
+            sections["growth_prospects"].append(line)
+        elif "change" in line_lower or "restructure" in line_lower or "business model" in line_lower:
+            sections["business_changes"].append(line)
+        elif "trigger" in line_lower or "driver" in line_lower:
+            sections["key_triggers"].append(line)
+        elif "impact" in line_lower or "effect" in line_lower or "earnings" in line_lower:
+            sections["material_effects"].append(line)
+    
+    return sections
+
+# Summarize each extracted section
+def summarize_sections(sections):
+    summarized_data = {}
+    for section, sentences in sections.items():
+        if sentences:
+            # Concatenate sentences and summarize
+            joined_text = " ".join(sentences)
+            try:
+                summary = summarizer(joined_text, max_length=100, min_length=30, do_sample=False)
+                summarized_data[section] = summary[0]['summary_text']
+            except Exception as e:
+                print(f"Error summarizing section '{section}': {e}")
+                summarized_data[section] = "Summary not available."
+    return summarized_data
+
+# Main function to orchestrate the PDF analysis and summarization
+def analyze_pdf(pdf_path):
+    # Step 1: Extract and preprocess the text
+    raw_text = extract_text_from_pdf(pdf_path)
+    clean_text = preprocess_text(raw_text)
+    
+    # Step 2: Extract key sections based on keywords
+    sections = extract_key_sections(clean_text)
+    
+    # Step 3: Summarize each identified section
+    summaries = summarize_sections(sections)
+    
+    return summaries
+
+# Run the function on a sample PDF
+if __name__ == "__main__":
+    pdf_path = "example.pdf"  # Update with actual file path
+    extracted_data = analyze_pdf(pdf_path)
+    
+    # Display the results in a JSON-like format
+    import json
+    print(json.dumps(extracted_data, indent=4))
+--------------------------------------------------------------------------------------------------------------------------------
+
+3. services.py
+Handles text extraction and question processing.
+
+
+from langchain_community.document_loaders import PyMuPDFLoader
+from transformers import pipeline
+
+def extract_text_from_pdf(pdf_path):
+    loader = PyMuPDFLoader(pdf_path)
+    documents = loader.load()
+    
+    # Join the text content of each document page into a single string
+    text_content = "\n".join([doc.page_content for doc in documents])
+    return text_content 
+
+def answer_question(document_content, question):
+    # Load a question-answering pipeline
+    qa_pipeline = pipeline("question-answering", model="distilbert/distilbert-base-cased-distilled-squad")
+
+
+    def answer_question_from_huggingface(context, question):
+        return qa_pipeline(question=question, context=context)
+
+    answer = answer_question_from_huggingface(document_content, question)
+    print(answer['answer'])
+    # answer = 'ss'
+    return answer['answer']
+--------------------------------------------------------------------------------------------------------------------------------
+
+4. main.py
+The main FastAPI application.
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import os
+from sqlalchemy.orm import Session
+from .database import SessionLocal, PDFDocument, init_db
+from .services import extract_text_from_pdf, answer_question
+
+app = FastAPI()
+
+# Allow CORS from localhost:3000 (where your React app is running)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # Allow React app's origin
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods (GET, POST, etc.)
+    allow_headers=["*"],  # Allows all headers
+)
+
+@app.on_event("startup")
+def on_startup():
+    init_db()
+
+@app.post("/upload/")
+async def upload_pdf(file: UploadFile = File(...)):
+    # Ensure the 'uploaded_pdfs' directory exists
+    upload_dir = "./uploaded_pdfs"
+    os.makedirs(upload_dir, exist_ok=True)
+    
+    file_path = os.path.join(upload_dir, file.filename)
+    
+    with open(file_path, "wb") as f:
+        f.write(file.file.read())
+    text_content = extract_text_from_pdf(file_path)
+
+    db = SessionLocal()
+    pdf_document = PDFDocument(filename=file.filename, content=text_content)
+    db.add(pdf_document)
+    db.commit()
+    db.close()
+
+    return {"message": "File uploaded successfully", "filename": file.filename}
+
+@app.post("/ask/")  # Assuming you also need CORS for the ask endpoint
+async def ask_question(filename: str = Form(...), question: str = Form(...)):
+    db = SessionLocal()
+    
+    # Ensure that the filename includes ".pdf"
+    if not filename.endswith(".pdf"):
+        filename += ".pdf"
+
+    pdf_doc = db.query(PDFDocument).filter(PDFDocument.filename == filename).first()
+    db.close()
+    if not pdf_doc:
+        raise HTTPException(status_code=404, detail="PDF not found")
+
+    document_content = pdf_doc.content
+
+    answer = answer_question(document_content, question)
+    return {"answer": answer}
+--------------------------------------------------------------------------------------------------------------------------------
+
+Frontend: React.js
+1. App.js
+The main app structure.
+
+import React, { useState } from 'react';
+import UploadPDF from './components/UploadPDF';
+import AskQuestion from './components/AskQuestion';
+import './App.css';
+
+function App() {
+  const [messages, setMessages] = useState([
+    { text: 'Hello! How can I assist you today?', isBot: true }
+  ]);
+  const [uploadedFileName, setUploadedFileName] = useState('');  // New state for file name
+
+  const addMessage = (message, isBot = false) => {
+    setMessages((prevMessages) => [...prevMessages, { text: message, isBot }]);
+  };
+
+  return (
+    <div className="app-container">
+      <div className="navbar">
+        <div className="logo">
+          <img src="path-to-your-logo" alt="AI Planet Logo" />
+          <span>formerly DPhi</span>
+        </div>
+        <div className="navbar-upload">
+          <UploadPDF addMessage={addMessage} setUploadedFileName={setUploadedFileName} />
+        </div>
+        {uploadedFileName && (
+          <div className="file-name-display">  {/* Display file name in header */}
+            <span>File: {uploadedFileName}</span>
+          </div>
+        )}
+      </div>
+
+      <div className="chat-section">
+        <div className="chat-box">
+          <div className="chat-history">
+            {messages.map((message, index) => (
+              <div
+                key={index}
+                className={message.isBot ? 'chat-bot-message' : 'chat-user-message'}
+              >
+                {message.text}
+              </div>
+            ))}
+          </div>
+
+          <AskQuestion addMessage={addMessage} uploadedFileName={uploadedFileName} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default App;
+--------------------------------------------------------------------------------------------------------------------------------
+
+2. UploadPDF.js
+Handles PDF file uploads.
+
+import React, { useState } from 'react';
+import { uploadPDF } from '../services/api';
+import './UploadPDF.css';
+
+const UploadPDF = ({ addMessage, setUploadedFileName }) => {
+    const [file, setFile] = useState(null);
+
+    const handleFileChange = (e) => setFile(e.target.files[0]);
+
+    const handleUpload = async () => {
+        if (!file) {
+            addMessage("Please select a file to upload.", true);
+            return;
+        }
+        try {
+            const response = await uploadPDF(file);
+            setUploadedFileName(file.name);  // Set the uploaded file name in App.js
+            addMessage(response.data.message, true);
+        } catch (error) {
+            addMessage("Error uploading file", true);
+        }
+    };
+
+    return (
+        <div className="upload-button-container">
+            <input type="file" onChange={handleFileChange} className="file-input" />
+            <button onClick={handleUpload} className="upload-button">Upload PDF</button>
+        </div>
+    );
+};
+
+export default UploadPDF;
+--------------------------------------------------------------------------------------------------------------------------------
+
+3. AskQuestion.js
+Lets users ask questions based on uploaded documents.
+
+import React, { useState, useEffect } from 'react';
+import { askQuestion } from '../services/api';
+import './AskQuestion.css';
+
+const AskQuestion = ({ addMessage, uploadedFileName }) => {
+    const [question, setQuestion] = useState('');
+
+    useEffect(() => {
+        setQuestion('');
+    }, [uploadedFileName]);
+
+    const handleAsk = async () => {
+        if (!uploadedFileName) {
+            addMessage("Please upload a file before asking a question.", true);
+            return;
+        }
+        if (!question) {
+            addMessage("Please enter a question.", true);
+            return;
+        }
+
+        addMessage(question, false);
+
+        try {
+            const response = await askQuestion(uploadedFileName, question);
+            addMessage(response.data.answer, true);
+        } catch (error) {
+            addMessage("Error fetching answer.", true);
+        }
+
+        setQuestion('');
+    };
+
+    return (
+        <div className="chat-input">
+            <input
+                type="text"
+                placeholder="Ask a question..."
+                value={question}
+                onChange={(e) => setQuestion(e.target.value)}
+            />
+            <button onClick={handleAsk} className="send-button">→</button>
+        </div>
+    );
+};
+
+export default AskQuestion;
