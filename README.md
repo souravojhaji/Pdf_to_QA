@@ -15,12 +15,12 @@ A full-stack application for uploading PDFs, asking questions on PDF content, an
     ```bash
     python -m venv env
 
-2. activate created virtual env for backend
-- for windows
+2. Activate created virtual env for backend
+- For windows
     ```bash
     . \env\Scripts\activate
 
-- for ubuntu
+- For ubuntu
     source env/bin/activate
 
 3. Install dependencies:
@@ -28,9 +28,11 @@ A full-stack application for uploading PDFs, asking questions on PDF content, an
    pip install -r requirements.txt
 
 4. Run backend
+    - To run this you need to stay in main project folder not in backend folder
     ```bash
     uvicorn backend.main:app --reload
 
 5. Run frontend
+    - To run this stay in frontend folder
     ```bash
     npm start
